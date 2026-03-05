@@ -5,3 +5,9 @@ dashboard.log
 .codex/
 .cursor/
 .memorix/
+dashboard.db
+dashboard.db-wal
+dashboard.db-shm
+test.db
+test.db-wal
+test.db-shm
