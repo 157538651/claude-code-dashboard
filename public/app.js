@@ -8,6 +8,7 @@ let lastRows = 0;
 let projectsCache = [];
 let sessionsCache = [];
 let pendingAction = null;
+let tasksCache = [];
 let projectSearchQuery = '';
 let termFontSize = parseInt(localStorage.getItem('termFontSize')) || (window.innerWidth <= 768 ? 12 : 14);
 let idleWarningTimer = null;
@@ -832,6 +833,8 @@ function showDashboardPanel() {
     document.getElementById('dashboardProjectName').textContent = currentProject.name;
     document.getElementById('dashboardProjectPath').textContent = currentProject.path;
 
+    loadTasks();
+
     // Active sessions for this project
     const projectSessions = getProjectSessions(currentProject.id);
     const sessionsEl = document.getElementById('dashboardSessions');
@@ -958,9 +961,11 @@ function initApp() {
     appInitialized = true;
     initTerminal();
     loadProjects();
+    loadTasks();
     connectWebSocket();
     refreshHealth();
     setInterval(refreshHealth, 10000);
+    setInterval(loadTasks, 15000);
 }
 
 // ---- 批量关闭会话 ----
@@ -980,6 +985,8 @@ document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') {
         closeAllPopups();
         closeChangePassword();
+        closeCreateTaskModal();
+        closeTaskDetailModal();
         document.getElementById('healthPanel').classList.remove('open');
     }
 });
@@ -1062,6 +1069,247 @@ async function syncClipboardImage(blob) {
         clipboardSyncing = false;
     };
     reader.readAsDataURL(blob);
+}
+
+// ---- 定时任务 ----
+
+async function loadTasks() {
+    try {
+        const res = await authFetch('/api/tasks');
+        tasksCache = await res.json();
+    } catch {
+        tasksCache = [];
+    }
+    renderTasks();
+}
+
+function renderTasks() {
+    const el = document.getElementById('dashboardTasks');
+    if (!el) return;
+    if (tasksCache.length === 0) {
+        el.innerHTML = '<div style="color:var(--c-text-dim);font-size:12px;padding:8px;">无定时任务</div>';
+        return;
+    }
+    el.innerHTML = tasksCache.map(t => {
+        const running = t.runningCount > 0;
+        const dotClass = running ? 'running' : (t.enabled ? 'enabled' : 'disabled');
+        const schedule = t.cron_expr || '仅手动';
+        const project = projectsCache.find(p => p.id === t.project_id);
+        const projectName = project ? escapeHtml(project.name) : escapeHtml(t.project_id);
+        const statusText = running ? '运行中' : (t.enabled ? '就绪' : '已禁用');
+        return `<div class="dashboard-session-item" onclick="showTaskDetail('${escapeHtml(t.id)}')">
+            <div style="display:flex;align-items:center;gap:8px;min-width:0;flex:1;">
+                <span class="task-status-dot ${dotClass}"></span>
+                <div style="min-width:0;flex:1;">
+                    <div style="font-size:12px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHtml(t.name)}</div>
+                    <div class="task-meta">${projectName} · ${escapeHtml(schedule)} · ${statusText}</div>
+                </div>
+            </div>
+            <div class="task-actions" onclick="event.stopPropagation()">
+                ${running
+                    ? `<button onclick="event.stopPropagation();attachTaskRun('${escapeHtml(t.id)}')" title="查看终端">attach</button>`
+                    : `<button onclick="event.stopPropagation();triggerTask('${escapeHtml(t.id)}')" title="手动触发">触发</button>`}
+            </div>
+        </div>`;
+    }).join('');
+}
+
+function showCreateTaskModal() {
+    const modal = document.getElementById('createTaskModal');
+    modal.classList.add('open');
+    document.getElementById('taskName').value = '';
+    document.getElementById('taskPrompt').value = '';
+    document.getElementById('taskCron').value = '';
+    document.getElementById('createTaskError').textContent = '';
+    document.querySelector('input[name="taskMode"][value="new"]').checked = true;
+
+    // Populate project select
+    const select = document.getElementById('taskProject');
+    select.innerHTML = projectsCache.map(p =>
+        `<option value="${escapeHtml(p.id)}" ${currentProject && p.id === currentProject.id ? 'selected' : ''}>${escapeHtml(p.name)}</option>`
+    ).join('');
+
+    document.getElementById('taskName').focus();
+}
+
+function closeCreateTaskModal() {
+    document.getElementById('createTaskModal').classList.remove('open');
+}
+
+async function doCreateTask() {
+    const name = document.getElementById('taskName').value.trim();
+    const project_id = document.getElementById('taskProject').value;
+    const prompt = document.getElementById('taskPrompt').value.trim();
+    const cron_expr = document.getElementById('taskCron').value.trim();
+    const execution_mode = document.querySelector('input[name="taskMode"]:checked').value;
+    const errorEl = document.getElementById('createTaskError');
+
+    if (!name || !prompt) { errorEl.textContent = '名称和 Prompt 不能为空'; return; }
+
+    try {
+        const res = await authFetch('/api/tasks', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, project_id, prompt, cron_expr: cron_expr || undefined, execution_mode })
+        });
+        const data = await res.json();
+        if (res.ok) {
+            closeCreateTaskModal();
+            showToast('任务创建成功');
+            loadTasks();
+        } else {
+            errorEl.textContent = data.error;
+        }
+    } catch (e) {
+        errorEl.textContent = e.message;
+    }
+}
+
+let currentTaskDetail = null;
+
+function showTaskDetail(taskId) {
+    const task = tasksCache.find(t => t.id === taskId);
+    if (!task) return;
+    currentTaskDetail = task;
+
+    document.getElementById('taskDetailName').textContent = task.name;
+    const project = projectsCache.find(p => p.id === task.project_id);
+    document.getElementById('taskDetailProject').textContent = project ? project.name : task.project_id;
+    document.getElementById('taskDetailCron').textContent = task.cron_expr || '仅手动';
+    document.getElementById('taskDetailMode').textContent = task.execution_mode === 'resume' ? '恢复会话' : '新会话';
+    document.getElementById('taskDetailPrompt').textContent = task.prompt;
+
+    // Actions
+    const actionsEl = document.getElementById('taskDetailActions');
+    const running = task.runningCount > 0;
+    actionsEl.innerHTML = `
+        <button class="btn btn-new" style="padding:4px 12px;font-size:12px;" onclick="triggerTask('${escapeHtml(task.id)}')">触发</button>
+        ${running ? `<button class="btn btn-kill" style="display:inline;padding:4px 12px;font-size:12px;" onclick="cancelTask('${escapeHtml(task.id)}')">取消运行</button>` : ''}
+        <button class="btn" style="padding:4px 12px;font-size:12px;color:var(--c-text-muted);border:1px solid var(--c-border);" onclick="toggleTaskEnabled('${escapeHtml(task.id)}', ${task.enabled ? 0 : 1})">${task.enabled ? '禁用' : '启用'}</button>
+        <button class="btn btn-kill" style="display:inline;padding:4px 12px;font-size:12px;" onclick="doDeleteTask('${escapeHtml(task.id)}')">删除</button>
+    `;
+
+    document.getElementById('taskLogContainer').style.display = 'none';
+    document.getElementById('taskDetailModal').classList.add('open');
+    loadTaskRuns(task.id);
+}
+
+function closeTaskDetailModal() {
+    document.getElementById('taskDetailModal').classList.remove('open');
+    currentTaskDetail = null;
+}
+
+async function loadTaskRuns(taskId) {
+    const listEl = document.getElementById('taskRunList');
+    try {
+        const res = await authFetch(`/api/tasks/${taskId}/runs?limit=10`);
+        const runs = await res.json();
+        if (runs.length === 0) {
+            listEl.innerHTML = '<div style="color:var(--c-text-dim);font-size:12px;padding:6px;">暂无运行记录</div>';
+            return;
+        }
+        listEl.innerHTML = runs.map(r => {
+            const time = r.started_at ? formatTime(r.started_at) : '--';
+            const hasSession = r.session_id && r.status === 'running';
+            return `<div class="run-item">
+                <div style="display:flex;align-items:center;gap:6px;">
+                    <span class="run-status ${escapeHtml(r.status)}">${escapeHtml(r.status)}</span>
+                    <span style="color:var(--c-text-dim);font-size:11px;">${time}</span>
+                </div>
+                <div style="display:flex;gap:4px;">
+                    ${hasSession ? `<button class="btn" style="padding:2px 6px;font-size:10px;color:var(--c-accent);border:1px solid var(--c-accent);" onclick="attachTaskRun('${escapeHtml(taskId)}')">attach</button>` : ''}
+                    <button class="btn" style="padding:2px 6px;font-size:10px;color:var(--c-text-muted);border:1px solid var(--c-border);" onclick="viewRunLog('${escapeHtml(r.id)}')">日志</button>
+                </div>
+            </div>`;
+        }).join('');
+    } catch {
+        listEl.innerHTML = '<div style="color:var(--c-red);font-size:12px;">加载失败</div>';
+    }
+}
+
+async function viewRunLog(runId) {
+    const container = document.getElementById('taskLogContainer');
+    const viewer = document.getElementById('taskLogViewer');
+    container.style.display = 'block';
+    viewer.textContent = '加载中...';
+    try {
+        const res = await authFetch(`/api/tasks/runs/${runId}/log`);
+        const data = await res.json();
+        viewer.textContent = data.log || '(无日志)';
+        if (data.truncated) viewer.textContent = '... (日志已截断)\n' + viewer.textContent;
+    } catch {
+        viewer.textContent = '加载失败';
+    }
+}
+
+async function triggerTask(taskId) {
+    try {
+        await authFetch(`/api/tasks/${taskId}/trigger`, { method: 'POST' });
+        showToast('任务已触发');
+        setTimeout(loadTasks, 1000);
+    } catch (e) {
+        showToast('触发失败: ' + e.message);
+    }
+}
+
+async function cancelTask(taskId) {
+    try {
+        await authFetch(`/api/tasks/${taskId}/cancel`, { method: 'POST' });
+        showToast('已取消运行');
+        loadTasks();
+        if (currentTaskDetail && currentTaskDetail.id === taskId) {
+            setTimeout(() => showTaskDetail(taskId), 500);
+        }
+    } catch (e) {
+        showToast('取消失败: ' + e.message);
+    }
+}
+
+function attachTaskRun(taskId) {
+    const task = tasksCache.find(t => t.id === taskId);
+    if (!task || !task.latestRun || !task.latestRun.session_id) {
+        showToast('无运行中的会话');
+        return;
+    }
+    closeTaskDetailModal();
+    // Set project context
+    const project = projectsCache.find(p => p.id === task.project_id);
+    if (project) {
+        currentProject = project;
+        document.getElementById('projectTitle').textContent = project.name;
+        document.getElementById('headerProjectPath').textContent = project.path;
+        document.getElementById('projectSwitchLabel').textContent = project.name;
+    }
+    switchSession(task.latestRun.session_id, task.project_id);
+}
+
+async function toggleTaskEnabled(taskId, enabled) {
+    try {
+        await authFetch(`/api/tasks/${taskId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ enabled })
+        });
+        showToast(enabled ? '任务已启用' : '任务已禁用');
+        await loadTasks();
+        if (currentTaskDetail && currentTaskDetail.id === taskId) {
+            showTaskDetail(taskId);
+        }
+    } catch (e) {
+        showToast('操作失败: ' + e.message);
+    }
+}
+
+async function doDeleteTask(taskId) {
+    if (!confirm('确定删除此任务？运行记录和日志也将一并删除。')) return;
+    try {
+        await authFetch(`/api/tasks/${taskId}`, { method: 'DELETE' });
+        showToast('任务已删除');
+        closeTaskDetailModal();
+        loadTasks();
+    } catch (e) {
+        showToast('删除失败: ' + e.message);
+    }
 }
 
 // 启动时检查认证状态

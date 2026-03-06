@@ -8,6 +8,7 @@ const http = require('http');
 const WebSocket = require('ws');
 const pty = require('node-pty');
 const Database = require('better-sqlite3');
+const cron = require('node-cron');
 
 const app = express();
 const PORT = 3000;
@@ -229,6 +230,47 @@ db.exec(`
   )
 `);
 
+// ---- 定时任务表 ----
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    cron_expr TEXT,
+    execution_mode TEXT NOT NULL DEFAULT 'new',
+    resume_session_id TEXT,
+    priority INTEGER NOT NULL DEFAULT 0,
+    max_concurrency INTEGER NOT NULL DEFAULT 1,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+  )
+`);
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS task_runs (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    session_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    started_at INTEGER,
+    finished_at INTEGER,
+    exit_code INTEGER,
+    log_path TEXT,
+    error TEXT
+  )
+`);
+
+// 启动时清理孤儿运行记录
+db.prepare("UPDATE task_runs SET status='failed', finished_at=?, error='Server restarted' WHERE status='running'").run(Date.now());
+
+const cronJobs = new Map();          // taskId → cron.ScheduledTask
+const runningTaskCounts = new Map(); // taskId → number
+const logsBaseDir = path.join(os.homedir(), '.claude-dashboard', 'logs');
+
 const projectsDir = path.join(os.homedir(), 'projects');
 
 let projectsCache = null;
@@ -285,6 +327,89 @@ function updateProjectUsage(projectId) {
     ON CONFLICT(project_id) DO UPDATE SET use_count = use_count + 1, last_used_at = ?
   `).run(projectId, now, now);
 }
+
+// ---- 定时任务调度器 ----
+
+function executeTask(task) {
+  const count = runningTaskCounts.get(task.id) || 0;
+  if (task.max_concurrency > 0 && count >= task.max_concurrency) {
+    console.log(`任务 ${task.name} 跳过：已达并发上限 (${count}/${task.max_concurrency})`);
+    return;
+  }
+
+  const runId = crypto.randomBytes(8).toString('hex');
+  const logDir = path.join(logsBaseDir, task.id);
+  if (!fs.existsSync(logDir)) fs.mkdirSync(logDir, { recursive: true });
+  const logPath = path.join(logDir, `${runId}.log`);
+
+  db.prepare('INSERT INTO task_runs (id, task_id, status, started_at, log_path) VALUES (?, ?, ?, ?, ?)')
+    .run(runId, task.id, 'running', Date.now(), logPath);
+
+  runningTaskCounts.set(task.id, count + 1);
+
+  const resume = task.execution_mode === 'resume';
+  const result = createSession(task.project_id, 80, 24, resume, task.owner);
+  if (!result || (typeof result === 'object' && result.error)) {
+    const errMsg = (typeof result === 'object' && result.error) || '项目不存在';
+    db.prepare("UPDATE task_runs SET status='failed', finished_at=?, error=? WHERE id=?")
+      .run(Date.now(), errMsg, runId);
+    runningTaskCounts.set(task.id, Math.max(0, count));
+    return;
+  }
+
+  const sessionId = result;
+  const session = sessions.get(sessionId);
+
+  db.prepare('UPDATE task_runs SET session_id=? WHERE id=?').run(sessionId, runId);
+
+  // Attach log stream and task metadata to session
+  session._logStream = fs.createWriteStream(logPath, { flags: 'a' });
+  session._runId = runId;
+  session._taskId = task.id;
+
+  // Inject prompt after claude boots
+  setTimeout(() => {
+    if (sessions.has(sessionId)) {
+      session.pty.write(task.prompt + '\n');
+    }
+  }, 2000);
+
+  console.log(`任务 ${task.name} 执行中: run=${runId}, session=${sessionId}`);
+}
+
+function registerCronJobs() {
+  // Stop all existing cron jobs
+  for (const [, job] of cronJobs) job.stop();
+  cronJobs.clear();
+
+  const tasks = db.prepare("SELECT * FROM scheduled_tasks WHERE enabled=1 AND cron_expr IS NOT NULL").all();
+  for (const task of tasks) {
+    if (!cron.validate(task.cron_expr)) {
+      console.log(`任务 ${task.name} cron 表达式无效: ${task.cron_expr}`);
+      continue;
+    }
+    const job = cron.schedule(task.cron_expr, () => {
+      console.log(`Cron 触发任务: ${task.name}`);
+      // Re-read from DB to get latest state
+      const latest = db.prepare('SELECT * FROM scheduled_tasks WHERE id=? AND enabled=1').get(task.id);
+      if (latest) executeTask(latest);
+    });
+    cronJobs.set(task.id, job);
+  }
+  console.log(`已注册 ${cronJobs.size} 个 cron 任务`);
+}
+
+// 日志清理：每 6 小时清理 7 天前的记录和文件
+const LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const logCleanupTimer = setInterval(() => {
+  const cutoff = Date.now() - LOG_RETENTION_MS;
+  const oldRuns = db.prepare('SELECT id, task_id, log_path FROM task_runs WHERE finished_at < ? AND finished_at IS NOT NULL').all(cutoff);
+  for (const run of oldRuns) {
+    if (run.log_path) try { fs.unlinkSync(run.log_path); } catch {}
+  }
+  db.prepare('DELETE FROM task_runs WHERE finished_at < ? AND finished_at IS NOT NULL').run(cutoff);
+  if (oldRuns.length > 0) console.log(`清理了 ${oldRuns.length} 条过期任务运行记录`);
+}, 6 * 60 * 60 * 1000);
 
 // 获取项目列表
 app.get('/api/projects', (req, res) => {
@@ -368,9 +493,17 @@ function createSession(projectId, cols, rows, resume, owner) {
     if (session.attachedWs && session.attachedWs.readyState === WebSocket.OPEN) {
       session.attachedWs.send(JSON.stringify({ type: 'output', data }));
     }
+    if (session._logStream) session._logStream.write(data);
   });
 
-  ptyProcess.onExit(() => {
+  ptyProcess.onExit(({ exitCode }) => {
+    // 完成任务运行记录
+    if (session._runId) {
+      if (session._logStream) session._logStream.end();
+      db.prepare("UPDATE task_runs SET status='completed', finished_at=?, exit_code=? WHERE id=? AND status='running'")
+        .run(Date.now(), exitCode || 0, session._runId);
+      runningTaskCounts.set(session._taskId, Math.max(0, (runningTaskCounts.get(session._taskId) || 1) - 1));
+    }
     if (session.attachedWs && session.attachedWs.readyState === WebSocket.OPEN) {
       session.attachedWs.send(JSON.stringify({ type: 'exit', sessionId }));
     } else {
@@ -511,6 +644,129 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// ---- 定时任务 API ----
+
+app.use('/api/tasks', requireAuth);
+
+// 任务列表
+app.get('/api/tasks', (req, res) => {
+  const tasks = db.prepare('SELECT * FROM scheduled_tasks WHERE owner=? ORDER BY created_at DESC').all(req.username);
+  const result = tasks.map(t => {
+    const latestRun = db.prepare('SELECT * FROM task_runs WHERE task_id=? ORDER BY started_at DESC LIMIT 1').get(t.id);
+    const runningCount = runningTaskCounts.get(t.id) || 0;
+    return { ...t, latestRun, runningCount };
+  });
+  res.json(result);
+});
+
+// 创建任务
+app.post('/api/tasks', (req, res) => {
+  const { name, project_id, prompt, cron_expr, execution_mode, max_concurrency } = req.body;
+  if (!name || !project_id || !prompt) return res.status(400).json({ error: '名称、项目和 Prompt 不能为空' });
+  if (cron_expr && !cron.validate(cron_expr)) return res.status(400).json({ error: 'Cron 表达式无效' });
+  const project = scanProjects().find(p => p.id === project_id);
+  if (!project) return res.status(400).json({ error: '项目不存在' });
+
+  const id = crypto.randomBytes(8).toString('hex');
+  const now = Date.now();
+  db.prepare(`INSERT INTO scheduled_tasks (id, name, project_id, owner, prompt, cron_expr, execution_mode, max_concurrency, created_at, updated_at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+    .run(id, name, project_id, req.username, prompt, cron_expr || null, execution_mode || 'new', max_concurrency || 1, now, now);
+  registerCronJobs();
+  res.json({ id });
+});
+
+// 编辑任务
+app.put('/api/tasks/:id', (req, res) => {
+  const task = db.prepare('SELECT * FROM scheduled_tasks WHERE id=? AND owner=?').get(req.params.id, req.username);
+  if (!task) return res.status(404).json({ error: '任务不存在' });
+  const { name, project_id, prompt, cron_expr, execution_mode, max_concurrency, enabled } = req.body;
+  if (cron_expr && !cron.validate(cron_expr)) return res.status(400).json({ error: 'Cron 表达式无效' });
+
+  db.prepare(`UPDATE scheduled_tasks SET name=?, project_id=?, prompt=?, cron_expr=?, execution_mode=?, max_concurrency=?, enabled=?, updated_at=? WHERE id=?`)
+    .run(
+      name ?? task.name, project_id ?? task.project_id, prompt ?? task.prompt,
+      cron_expr !== undefined ? (cron_expr || null) : task.cron_expr,
+      execution_mode ?? task.execution_mode, max_concurrency ?? task.max_concurrency,
+      enabled !== undefined ? (enabled ? 1 : 0) : task.enabled, Date.now(), req.params.id
+    );
+  registerCronJobs();
+  res.json({ success: true });
+});
+
+// 删除任务
+app.delete('/api/tasks/:id', (req, res) => {
+  const task = db.prepare('SELECT * FROM scheduled_tasks WHERE id=? AND owner=?').get(req.params.id, req.username);
+  if (!task) return res.status(404).json({ error: '任务不存在' });
+
+  // Stop cron job
+  const job = cronJobs.get(req.params.id);
+  if (job) { job.stop(); cronJobs.delete(req.params.id); }
+
+  // Clean up logs
+  const logDir = path.join(logsBaseDir, req.params.id);
+  try { fs.rmSync(logDir, { recursive: true, force: true }); } catch {}
+
+  db.prepare('DELETE FROM task_runs WHERE task_id=?').run(req.params.id);
+  db.prepare('DELETE FROM scheduled_tasks WHERE id=?').run(req.params.id);
+  runningTaskCounts.delete(req.params.id);
+  res.json({ success: true });
+});
+
+// 手动触发任务
+app.post('/api/tasks/:id/trigger', (req, res) => {
+  const task = db.prepare('SELECT * FROM scheduled_tasks WHERE id=? AND owner=?').get(req.params.id, req.username);
+  if (!task) return res.status(404).json({ error: '任务不存在' });
+  executeTask(task);
+  res.json({ success: true });
+});
+
+// 取消任务运行（kill PTY）
+app.post('/api/tasks/:id/cancel', (req, res) => {
+  const task = db.prepare('SELECT * FROM scheduled_tasks WHERE id=? AND owner=?').get(req.params.id, req.username);
+  if (!task) return res.status(404).json({ error: '任务不存在' });
+
+  const runningRuns = db.prepare("SELECT * FROM task_runs WHERE task_id=? AND status='running'").all(req.params.id);
+  for (const run of runningRuns) {
+    if (run.session_id) {
+      const session = sessions.get(run.session_id);
+      if (session) {
+        if (session._logStream) session._logStream.end();
+        killPty(session.pty);
+      }
+    }
+    db.prepare("UPDATE task_runs SET status='cancelled', finished_at=? WHERE id=?").run(Date.now(), run.id);
+  }
+  runningTaskCounts.set(req.params.id, 0);
+  res.json({ success: true });
+});
+
+// 运行历史
+app.get('/api/tasks/:id/runs', (req, res) => {
+  const task = db.prepare('SELECT * FROM scheduled_tasks WHERE id=? AND owner=?').get(req.params.id, req.username);
+  if (!task) return res.status(404).json({ error: '任务不存在' });
+  const limit = parseInt(req.query.limit) || 20;
+  const offset = parseInt(req.query.offset) || 0;
+  const runs = db.prepare('SELECT * FROM task_runs WHERE task_id=? ORDER BY started_at DESC LIMIT ? OFFSET ?').all(req.params.id, limit, offset);
+  res.json(runs);
+});
+
+// 读取运行日志（tail 100KB）
+app.get('/api/tasks/runs/:runId/log', (req, res) => {
+  const run = db.prepare('SELECT tr.*, st.owner FROM task_runs tr JOIN scheduled_tasks st ON tr.task_id=st.id WHERE tr.id=?').get(req.params.runId);
+  if (!run || run.owner !== req.username) return res.status(404).json({ error: '记录不存在' });
+  if (!run.log_path || !fs.existsSync(run.log_path)) return res.json({ log: '' });
+
+  const stat = fs.statSync(run.log_path);
+  const maxBytes = 100 * 1024;
+  const start = Math.max(0, stat.size - maxBytes);
+  const stream = fs.createReadStream(run.log_path, { start, encoding: 'utf8' });
+  let content = '';
+  stream.on('data', chunk => { content += chunk; });
+  stream.on('end', () => res.json({ log: content, truncated: start > 0 }));
+  stream.on('error', () => res.json({ log: '' }));
+});
+
 // 创建 HTTP 服务器并绑定 WebSocket
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
@@ -588,6 +844,9 @@ wss.on('connection', (ws, req) => {
   });
 });
 
+// 启动时注册 cron 任务
+registerCronJobs();
+
 if (require.main === module) {
   server.listen(PORT, () => {
     console.log(`Dashboard running on http://localhost:${PORT}`);
@@ -600,6 +859,10 @@ if (require.main === module) {
 // 下次启动时 session_records 中残留的 active 会被标记为 stale，用户可通过 resume 恢复。
 function shutdown() {
   console.log('收到停机信号，清理会话...');
+  // 停止所有 cron jobs
+  for (const [, job] of cronJobs) job.stop();
+  cronJobs.clear();
+  if (logCleanupTimer) clearInterval(logCleanupTimer);
   for (const [id, session] of sessions) {
     killPty(session.pty);
     sessions.delete(id);
