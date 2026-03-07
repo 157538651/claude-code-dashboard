@@ -11,7 +11,7 @@ const Database = require('better-sqlite3');
 const cron = require('node-cron');
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 
 app.use(express.json({ limit: '10mb' }));
 
@@ -115,10 +115,17 @@ function getUserByToken(token) {
   return row ? row.username : null;
 }
 
+const DASHBOARD_API_KEY = process.env.DASHBOARD_API_KEY || null;
+
 function getUser(req) {
   const auth = req.headers.authorization;
   if (auth && auth.startsWith('Bearer ')) {
-    return getUserByToken(auth.slice(7));
+    const token = auth.slice(7);
+    if (DASHBOARD_API_KEY && token === DASHBOARD_API_KEY) {
+      const firstUser = db.prepare('SELECT username FROM users ORDER BY created_at ASC LIMIT 1').get();
+      return firstUser ? firstUser.username : null;
+    }
+    return getUserByToken(token);
   }
   return null;
 }
@@ -264,12 +271,16 @@ db.exec(`
   )
 `);
 
+db.exec('CREATE INDEX IF NOT EXISTS idx_task_runs_task_id ON task_runs(task_id, started_at DESC)');
+db.exec('CREATE INDEX IF NOT EXISTS idx_task_runs_finished ON task_runs(finished_at)');
+
 // 启动时清理孤儿运行记录
 db.prepare("UPDATE task_runs SET status='failed', finished_at=?, error='Server restarted' WHERE status='running'").run(Date.now());
 
 const cronJobs = new Map();          // taskId → cron.ScheduledTask
 const runningTaskCounts = new Map(); // taskId → number
 const logsBaseDir = path.join(os.homedir(), '.claude-dashboard', 'logs');
+if (!fs.existsSync(logsBaseDir)) fs.mkdirSync(logsBaseDir, { recursive: true });
 
 const projectsDir = path.join(os.homedir(), 'projects');
 
@@ -334,7 +345,7 @@ function executeTask(task) {
   const count = runningTaskCounts.get(task.id) || 0;
   if (task.max_concurrency > 0 && count >= task.max_concurrency) {
     console.log(`任务 ${task.name} 跳过：已达并发上限 (${count}/${task.max_concurrency})`);
-    return;
+    return { error: '已达并发上限' };
   }
 
   const runId = crypto.randomBytes(8).toString('hex');
@@ -348,13 +359,18 @@ function executeTask(task) {
   runningTaskCounts.set(task.id, count + 1);
 
   const resume = task.execution_mode === 'resume';
-  const result = createSession(task.project_id, 80, 24, resume, task.owner);
+  // --print: non-interactive plain text output (no TUI, clean logs)
+  // --dangerously-skip-permissions: unattended execution, no confirmation prompts
+  const extraArgs = ['--print', '--dangerously-skip-permissions'];
+  if (task.prompt) extraArgs.push(task.prompt);
+
+  const result = createSession(task.project_id, 80, 24, resume, task.owner, extraArgs);
   if (!result || (typeof result === 'object' && result.error)) {
     const errMsg = (typeof result === 'object' && result.error) || '项目不存在';
     db.prepare("UPDATE task_runs SET status='failed', finished_at=?, error=? WHERE id=?")
       .run(Date.now(), errMsg, runId);
     runningTaskCounts.set(task.id, Math.max(0, count));
-    return;
+    return { error: errMsg };
   }
 
   const sessionId = result;
@@ -364,17 +380,14 @@ function executeTask(task) {
 
   // Attach log stream and task metadata to session
   session._logStream = fs.createWriteStream(logPath, { flags: 'a' });
+  session._logStream.on('error', (err) => {
+    console.error(`Log write error for task ${task.id}: ${err.message}`);
+  });
   session._runId = runId;
   session._taskId = task.id;
 
-  // Inject prompt after claude boots
-  setTimeout(() => {
-    if (sessions.has(sessionId)) {
-      session.pty.write(task.prompt + '\n');
-    }
-  }, 2000);
-
   console.log(`任务 ${task.name} 执行中: run=${runId}, session=${sessionId}`);
+  return { runId, sessionId };
 }
 
 function registerCronJobs() {
@@ -437,6 +450,7 @@ app.post('/api/clone', (req, res) => {
 // ---- 进程池 ----
 
 const sessions = new Map(); // sessionId -> { pty, buffer, projectId, owner, createdAt, lastActivity, attachedWs }
+let shuttingDown = false;
 const BUFFER_MAX = 200000;
 const IDLE_TIMEOUT = 30 * 60 * 1000;
 const MAX_SESSIONS_PER_USER = 5;
@@ -451,7 +465,20 @@ function killPty(p) {
   try { p.kill(); } catch {}
 }
 
-function createSession(projectId, cols, rows, resume, owner) {
+// Strip ANSI/terminal escape sequences + control chars for clean log files
+function stripAnsi(str) {
+  return str
+    .replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, '')      // CSI sequences
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '') // OSC sequences
+    .replace(/\x1b[()][AB012]/g, '')               // charset switches
+    .replace(/\x1b[>=<PNO]/g, '')                  // mode switches
+    .replace(/\x1b\[[\?]?[0-9;]*[hlmsu]/g, '')    // private modes
+    .replace(/\r(?!\n)/g, '')                       // bare CR (screen rewrite)
+    .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f]/g, '') // control chars (keep \t \n \r)
+    .replace(/\n{3,}/g, '\n\n');                    // collapse excessive blank lines
+}
+
+function createSession(projectId, cols, rows, resume, owner, extraArgs) {
   if (sessions.size >= MAX_SESSIONS_GLOBAL) return { error: '全局会话数已达上限' };
   let userCount = 0;
   for (const s of sessions.values()) { if (s.owner === owner) userCount++; }
@@ -465,6 +492,7 @@ function createSession(projectId, cols, rows, resume, owner) {
   delete env.CLAUDECODE;
 
   const args = resume ? ['--resume'] : [];
+  if (extraArgs) args.push(...extraArgs);
 
   const ptyProcess = pty.spawn(claudePath, args, {
     name: 'xterm-256color',
@@ -493,16 +521,23 @@ function createSession(projectId, cols, rows, resume, owner) {
     if (session.attachedWs && session.attachedWs.readyState === WebSocket.OPEN) {
       session.attachedWs.send(JSON.stringify({ type: 'output', data }));
     }
-    if (session._logStream) session._logStream.write(data);
+    if (session._logStream) session._logStream.write(stripAnsi(data));
   });
 
   ptyProcess.onExit(({ exitCode }) => {
+    if (shuttingDown) return;
     // 完成任务运行记录
     if (session._runId) {
-      if (session._logStream) session._logStream.end();
-      db.prepare("UPDATE task_runs SET status='completed', finished_at=?, exit_code=? WHERE id=? AND status='running'")
-        .run(Date.now(), exitCode || 0, session._runId);
-      runningTaskCounts.set(session._taskId, Math.max(0, (runningTaskCounts.get(session._taskId) || 1) - 1));
+      if (session._logStream && !session._logStreamEnded) {
+        session._logStreamEnded = true;
+        try { session._logStream.end(); } catch {}
+      }
+      const finalStatus = (exitCode ?? 0) === 0 ? 'completed' : 'failed';
+      db.prepare(`UPDATE task_runs SET status=?, finished_at=?, exit_code=? WHERE id=? AND status='running'`)
+        .run(finalStatus, Date.now(), exitCode ?? 0, session._runId);
+      const newCount = Math.max(0, (runningTaskCounts.get(session._taskId) || 1) - 1);
+      if (newCount === 0) runningTaskCounts.delete(session._taskId);
+      else runningTaskCounts.set(session._taskId, newCount);
     }
     if (session.attachedWs && session.attachedWs.readyState === WebSocket.OPEN) {
       session.attachedWs.send(JSON.stringify({ type: 'exit', sessionId }));
@@ -554,6 +589,10 @@ const idleCleanupTimer = setInterval(() => {
   for (const [id, session] of sessions) {
     if (!session.attachedWs && now - session.lastActivity > IDLE_TIMEOUT) {
       console.log(`清理空闲会话: ${id} (项目: ${session.projectId})`);
+      if (session._logStream && !session._logStreamEnded) {
+        session._logStreamEnded = true;
+        try { session._logStream.end(); } catch {}
+      }
       killPty(session.pty);
       recordSessionEnd(id);
       sessions.delete(id);
@@ -604,7 +643,9 @@ app.delete('/api/sessions/:id', (req, res) => {
     sessions.delete(req.params.id);
     return res.json({ success: true });
   }
-  // stale session
+  // stale session — verify ownership before deleting
+  const stale = db.prepare('SELECT owner FROM session_records WHERE session_id = ?').get(req.params.id);
+  if (stale && stale.owner !== req.username) return res.status(403).json({ error: '无权操作此会话' });
   recordSessionEnd(req.params.id);
   res.json({ success: true });
 });
@@ -651,16 +692,27 @@ app.use('/api/tasks', requireAuth);
 // 任务列表
 app.get('/api/tasks', (req, res) => {
   const tasks = db.prepare('SELECT * FROM scheduled_tasks WHERE owner=? ORDER BY created_at DESC').all(req.username);
-  const result = tasks.map(t => {
-    const latestRun = db.prepare('SELECT * FROM task_runs WHERE task_id=? ORDER BY started_at DESC LIMIT 1').get(t.id);
-    const runningCount = runningTaskCounts.get(t.id) || 0;
-    return { ...t, latestRun, runningCount };
-  });
+  // Batch fetch latest runs for all task IDs
+  const taskIds = tasks.map(t => t.id);
+  const latestRuns = new Map();
+  if (taskIds.length > 0) {
+    // SQLite doesn't have great batch support, but we can use a single query with GROUP BY
+    const runs = db.prepare(`SELECT * FROM task_runs WHERE task_id IN (${taskIds.map(() => '?').join(',')}) AND started_at = (SELECT MAX(started_at) FROM task_runs tr2 WHERE tr2.task_id = task_runs.task_id)`).all(...taskIds);
+    for (const r of runs) latestRuns.set(r.task_id, r);
+  }
+  const result = tasks.map(t => ({
+    ...t,
+    latestRun: latestRuns.get(t.id) || null,
+    runningCount: runningTaskCounts.get(t.id) || 0
+  }));
   res.json(result);
 });
 
 // 创建任务
+const MAX_TOTAL_TASKS = parseInt(process.env.MAX_TOTAL_TASKS) || 50;
 app.post('/api/tasks', (req, res) => {
+  const taskCount = db.prepare('SELECT COUNT(*) AS cnt FROM scheduled_tasks').get().cnt;
+  if (taskCount >= MAX_TOTAL_TASKS) return res.status(400).json({ error: `任务数已达上限 (${MAX_TOTAL_TASKS})` });
   const { name, project_id, prompt, cron_expr, execution_mode, max_concurrency } = req.body;
   if (!name || !project_id || !prompt) return res.status(400).json({ error: '名称、项目和 Prompt 不能为空' });
   if (cron_expr && !cron.validate(cron_expr)) return res.status(400).json({ error: 'Cron 表达式无效' });
@@ -671,7 +723,7 @@ app.post('/api/tasks', (req, res) => {
   const now = Date.now();
   db.prepare(`INSERT INTO scheduled_tasks (id, name, project_id, owner, prompt, cron_expr, execution_mode, max_concurrency, created_at, updated_at)
               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-    .run(id, name, project_id, req.username, prompt, cron_expr || null, execution_mode || 'new', max_concurrency || 1, now, now);
+    .run(id, name, project_id, req.username, prompt, cron_expr || null, execution_mode || 'new', max_concurrency ?? 1, now, now);
   registerCronJobs();
   res.json({ id });
 });
@@ -703,8 +755,25 @@ app.delete('/api/tasks/:id', (req, res) => {
   const job = cronJobs.get(req.params.id);
   if (job) { job.stop(); cronJobs.delete(req.params.id); }
 
+  // Kill running sessions for this task
+  const runningRuns = db.prepare("SELECT session_id FROM task_runs WHERE task_id=? AND status='running'").all(req.params.id);
+  for (const run of runningRuns) {
+    if (run.session_id) {
+      const s = sessions.get(run.session_id);
+      if (s) {
+        s._runId = null; // prevent onExit from writing to deleted records
+        if (s._logStream && !s._logStreamEnded) {
+          s._logStreamEnded = true;
+          try { s._logStream.end(); } catch {}
+        }
+        killPty(s.pty);
+      }
+    }
+  }
+
   // Clean up logs
   const logDir = path.join(logsBaseDir, req.params.id);
+  if (!logDir.startsWith(logsBaseDir)) return res.status(400).json({ error: '非法日志路径' });
   try { fs.rmSync(logDir, { recursive: true, force: true }); } catch {}
 
   db.prepare('DELETE FROM task_runs WHERE task_id=?').run(req.params.id);
@@ -714,11 +783,18 @@ app.delete('/api/tasks/:id', (req, res) => {
 });
 
 // 手动触发任务
+const MAX_CONCURRENT_RUNS = parseInt(process.env.MAX_CONCURRENT_RUNS) || 3;
 app.post('/api/tasks/:id/trigger', (req, res) => {
+  let totalRunning = 0;
+  for (const c of runningTaskCounts.values()) totalRunning += c;
+  if (totalRunning >= MAX_CONCURRENT_RUNS) return res.status(400).json({ error: `并发运行数已达上限 (${MAX_CONCURRENT_RUNS})` });
   const task = db.prepare('SELECT * FROM scheduled_tasks WHERE id=? AND owner=?').get(req.params.id, req.username);
   if (!task) return res.status(404).json({ error: '任务不存在' });
-  executeTask(task);
-  res.json({ success: true });
+  const result = executeTask(task);
+  if (!result || result.error) {
+    return res.status(400).json({ error: result ? result.error : '执行失败' });
+  }
+  res.json({ runId: result.runId, sessionId: result.sessionId });
 });
 
 // 取消任务运行（kill PTY）
@@ -731,7 +807,11 @@ app.post('/api/tasks/:id/cancel', (req, res) => {
     if (run.session_id) {
       const session = sessions.get(run.session_id);
       if (session) {
-        if (session._logStream) session._logStream.end();
+        session._runId = null; // prevent onExit from interfering
+        if (session._logStream && !session._logStreamEnded) {
+          session._logStreamEnded = true;
+          try { session._logStream.end(); } catch {}
+        }
         killPty(session.pty);
       }
     }
@@ -745,16 +825,28 @@ app.post('/api/tasks/:id/cancel', (req, res) => {
 app.get('/api/tasks/:id/runs', (req, res) => {
   const task = db.prepare('SELECT * FROM scheduled_tasks WHERE id=? AND owner=?').get(req.params.id, req.username);
   if (!task) return res.status(404).json({ error: '任务不存在' });
-  const limit = parseInt(req.query.limit) || 20;
+  const limit = Math.min(parseInt(req.query.limit) || 20, 100);
   const offset = parseInt(req.query.offset) || 0;
   const runs = db.prepare('SELECT * FROM task_runs WHERE task_id=? ORDER BY started_at DESC LIMIT ? OFFSET ?').all(req.params.id, limit, offset);
   res.json(runs);
+});
+
+// 删除运行记录和日志
+app.delete('/api/tasks/runs/:runId', (req, res) => {
+  const run = db.prepare('SELECT tr.*, st.owner FROM task_runs tr JOIN scheduled_tasks st ON tr.task_id=st.id WHERE tr.id=?').get(req.params.runId);
+  if (!run || run.owner !== req.username) return res.status(404).json({ error: '记录不存在' });
+  if (run.status === 'running') return res.status(400).json({ error: '无法删除运行中的记录' });
+  if (run.log_path && !run.log_path.startsWith(logsBaseDir)) return res.status(400).json({ error: '非法日志路径' });
+  if (run.log_path) { try { fs.unlinkSync(run.log_path); } catch {} }
+  db.prepare('DELETE FROM task_runs WHERE id=?').run(req.params.runId);
+  res.json({ success: true });
 });
 
 // 读取运行日志（tail 100KB）
 app.get('/api/tasks/runs/:runId/log', (req, res) => {
   const run = db.prepare('SELECT tr.*, st.owner FROM task_runs tr JOIN scheduled_tasks st ON tr.task_id=st.id WHERE tr.id=?').get(req.params.runId);
   if (!run || run.owner !== req.username) return res.status(404).json({ error: '记录不存在' });
+  if (run.log_path && !run.log_path.startsWith(logsBaseDir)) return res.status(400).json({ error: '非法日志路径' });
   if (!run.log_path || !fs.existsSync(run.log_path)) return res.json({ log: '' });
 
   const stat = fs.statSync(run.log_path);
@@ -763,7 +855,7 @@ app.get('/api/tasks/runs/:runId/log', (req, res) => {
   const stream = fs.createReadStream(run.log_path, { start, encoding: 'utf8' });
   let content = '';
   stream.on('data', chunk => { content += chunk; });
-  stream.on('end', () => res.json({ log: content, truncated: start > 0 }));
+  stream.on('end', () => res.json({ log: content, truncated: start > 0, totalSize: stat.size }));
   stream.on('error', () => res.json({ log: '' }));
 });
 
@@ -858,6 +950,7 @@ if (require.main === module) {
 // 注意：此处有意不调 recordSessionEnd，让 active 记录保留。
 // 下次启动时 session_records 中残留的 active 会被标记为 stale，用户可通过 resume 恢复。
 function shutdown() {
+  shuttingDown = true;
   console.log('收到停机信号，清理会话...');
   // 停止所有 cron jobs
   for (const [, job] of cronJobs) job.stop();
@@ -876,4 +969,4 @@ function shutdown() {
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
-module.exports = { app, server, db, sessions, idleCleanupTimer, hashPassword };
+module.exports = { app, server, db, sessions, idleCleanupTimer, hashPassword, cronJobs, runningTaskCounts };
