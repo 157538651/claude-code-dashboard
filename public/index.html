@@ -1076,6 +1076,63 @@
             background: var(--c-surface-hover);
         }
 
+        /* Task create modal */
+        .task-create-modal { width: 580px; }
+        .task-form-row-2col {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+        }
+        .task-form-group {
+            margin-bottom: 16px;
+        }
+        .task-form-label {
+            display: block;
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--c-text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 6px;
+        }
+        .task-form-input {
+            width: 100%;
+            box-sizing: border-box;
+            background: var(--c-input-bg);
+            border: 1px solid var(--c-border-light);
+            border-radius: 8px;
+            padding: 10px 12px;
+            color: var(--c-text);
+            font-size: 13px;
+            transition: border-color .15s, box-shadow .15s;
+        }
+        .task-form-input:focus {
+            outline: none;
+            border-color: var(--c-accent);
+            box-shadow: 0 0 0 3px rgba(99,132,255,0.12);
+        }
+        .task-form-input::placeholder { color: var(--c-text-faint); }
+        .task-form-select {
+            -webkit-appearance: none;
+            -moz-appearance: none;
+            appearance: none;
+            padding-right: 32px;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23999' d='M2 4l4 4 4-4'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 10px center;
+            cursor: pointer;
+        }
+        .task-options-card {
+            background: var(--c-input-bg);
+            border: 1px solid var(--c-border-light);
+            border-radius: 8px;
+            padding: 10px 12px;
+        }
+        .task-option-divider {
+            height: 1px;
+            background: var(--c-border);
+            margin: 8px 0;
+        }
         .task-radio-group {
             display: flex;
             gap: 16px;
@@ -1084,7 +1141,16 @@
             font-size: 12px;
             display: flex;
             align-items: center;
-            gap: 4px;
+            gap: 5px;
+            color: var(--c-text-dim);
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .task-checkbox-label {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
             color: var(--c-text-dim);
             cursor: pointer;
             white-space: nowrap;
@@ -2060,34 +2126,42 @@
 
     <!-- 创建任务弹窗 -->
     <div class="modal-overlay" id="createTaskModal">
-        <div class="modal-card" style="width:560px;">
+        <div class="modal-card task-create-modal">
             <h3>创建定时任务</h3>
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
-                <div class="modal-field" style="margin:0;">
-                    <input type="text" id="taskName" placeholder="任务名称">
+            <div class="task-form-row-2col">
+                <div class="task-form-group">
+                    <label class="task-form-label">任务名称</label>
+                    <input type="text" id="taskName" class="task-form-input" placeholder="例：每日代码审查">
                 </div>
-                <div class="modal-field" style="margin:0;">
-                    <select id="taskProject">
+                <div class="task-form-group">
+                    <label class="task-form-label">目标项目</label>
+                    <select id="taskProject" class="task-form-input task-form-select">
                         <option value="">选择项目...</option>
                     </select>
                 </div>
             </div>
-            <div class="modal-field">
-                <textarea id="taskPrompt" placeholder="Claude 执行指令 (prompt)" rows="4"></textarea>
+            <div class="task-form-group">
+                <label class="task-form-label">执行指令</label>
+                <textarea id="taskPrompt" class="task-form-input" placeholder="Claude 将执行的 prompt 内容..." rows="4" style="resize:vertical;font-family:'SF Mono',Monaco,monospace;font-size:12px;"></textarea>
             </div>
-            <div style="display:grid;grid-template-columns:1fr auto;gap:12px;align-items:start;">
-                <div class="modal-field" style="margin:0;">
-                    <input type="text" id="taskCron" placeholder="Cron 表达式（留空 = 仅手动触发）">
-                    <div class="task-cron-hint">例: */30 * * * * (每30分钟) · 0 */5 * * * (每5小时)</div>
+            <div class="task-form-row-2col">
+                <div class="task-form-group">
+                    <label class="task-form-label">定时调度</label>
+                    <input type="text" id="taskCron" class="task-form-input" placeholder="Cron 表达式（留空 = 手动）">
+                    <div class="task-cron-hint">*/30 * * * * 每30分 · 0 9 * * * 每天9点</div>
                 </div>
-                <div style="display:flex;flex-direction:column;gap:8px;padding-top:8px;">
-                    <div class="task-radio-group">
-                        <label><input type="radio" name="taskMode" value="new" checked> 新会话</label>
-                        <label><input type="radio" name="taskMode" value="resume"> 恢复会话</label>
+                <div class="task-form-group">
+                    <label class="task-form-label">运行选项</label>
+                    <div class="task-options-card">
+                        <div class="task-radio-group">
+                            <label><input type="radio" name="taskMode" value="new" checked> 新会话</label>
+                            <label><input type="radio" name="taskMode" value="resume"> 恢复</label>
+                        </div>
+                        <div class="task-option-divider"></div>
+                        <label class="task-checkbox-label">
+                            <input type="checkbox" id="taskYolo" checked> 无确认模式
+                        </label>
                     </div>
-                    <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--c-text-muted);cursor:pointer;white-space:nowrap;">
-                        <input type="checkbox" id="taskYolo" checked style="flex-shrink:0;"> 无确认模式
-                    </label>
                 </div>
             </div>
             <div class="modal-error" id="createTaskError"></div>
