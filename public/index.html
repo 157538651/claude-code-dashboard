@@ -2241,7 +2241,11 @@
                 </div>
             </div>
             <div class="header-right">
-                <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--c-text-dim);margin-right:10px;white-space:nowrap;">
+                <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--c-text-dim);white-space:nowrap;" title="自动滚动到底部">
+                    <input type="checkbox" id="autoScrollToggle" checked onchange="toggleAutoScroll(this.checked)">
+                    <span class="desktop-only">Scroll</span>
+                </label>
+                <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--c-text-dim);white-space:nowrap;" title="自动执行模式">
                     <input type="checkbox" id="sessionDangerToggle" onchange="toggleSessionDangerMode(this.checked)">
                     <span class="desktop-only">Auto</span>
                 </label>

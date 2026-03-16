@@ -37,6 +37,16 @@ let settingsRoots = [];
 const worktreeCache = {}; // projectId → { data: [...], expanded: false }
 let projectPickerIntent = null;
 
+// ---- 自动滚动 ----
+let autoScrollEnabled = localStorage.getItem('autoScroll') !== 'false';
+
+function toggleAutoScroll(enabled) {
+    autoScrollEnabled = enabled;
+    localStorage.setItem('autoScroll', enabled ? 'true' : 'false');
+    const el = document.getElementById('autoScrollToggle');
+    if (el) el.checked = enabled;
+}
+
 // ---- 自动执行模式 (--dangerously-skip-permissions) ----
 let globalDangerouslySkipPermissions = false;
 let sessionDangerouslySkipPermissions = false;
@@ -645,7 +655,7 @@ function createTabWebSocket(tabId, tabInfo) {
         const msg = JSON.parse(event.data);
         if (msg.type === 'output') {
             tabInfo.term.write(msg.data);
-            tabInfo.term.scrollToBottom();
+            if (autoScrollEnabled) tabInfo.term.scrollToBottom();
             if (tabInfo.sessionId === activeTabId) {
                 setActivityIdle(false);
                 if (activityTimeout) clearTimeout(activityTimeout);
@@ -653,7 +663,7 @@ function createTabWebSocket(tabId, tabInfo) {
             }
         } else if (msg.type === 'replay') {
             tabInfo.term.write(msg.data);
-            tabInfo.term.scrollToBottom();
+            if (autoScrollEnabled) tabInfo.term.scrollToBottom();
         } else if (msg.type === 'started') {
             const oldId = tabInfo.sessionId;
             tabInfo.sessionId = msg.sessionId;
@@ -1824,6 +1834,8 @@ function initApp() {
     if (appInitialized) return;
     appInitialized = true;
     initSidebarResize();
+    const scrollEl = document.getElementById('autoScrollToggle');
+    if (scrollEl) scrollEl.checked = autoScrollEnabled;
     initTerminal();
     loadGlobalSettings();
     loadProjects();
