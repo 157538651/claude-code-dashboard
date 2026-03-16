@@ -102,7 +102,6 @@
         .sidebar {
             width: 240px;
             background: var(--c-sidebar-bg, var(--c-surface));
-            border-right: 1px solid var(--c-border);
             display: flex;
             flex-direction: column;
             flex-shrink: 0;
@@ -118,6 +117,35 @@
             pointer-events: none;
         }
 
+        .sidebar-resizer {
+            width: 14px;
+            flex-shrink: 0;
+            position: relative;
+            cursor: col-resize;
+            background: transparent;
+        }
+
+        .sidebar-resizer::before {
+            content: "";
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 4px;
+            height: 56px;
+            transform: translate(-50%, -50%);
+            border-radius: 999px;
+            background: linear-gradient(180deg, rgba(74, 144, 226, 0.04), rgba(74, 144, 226, 0.16), rgba(74, 144, 226, 0.04));
+            opacity: 0;
+            transition: opacity 0.18s ease, background 0.18s ease, box-shadow 0.18s ease;
+        }
+
+        .sidebar-resizer:hover::before,
+        .sidebar-resizer.dragging::before {
+            opacity: 1;
+            background: linear-gradient(180deg, rgba(74, 144, 226, 0.18), rgba(74, 144, 226, 0.75), rgba(74, 144, 226, 0.18));
+            box-shadow: 0 0 0 4px rgba(74, 144, 226, 0.10);
+        }
+
         .sidebar-header {
             display: flex;
             justify-content: space-between;
@@ -131,15 +159,30 @@
             gap: 2px;
         }
         .sidebar-tab {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
             background: none;
             border: none;
             color: var(--c-text-dim);
             cursor: pointer;
-            padding: 6px 10px;
+            width: 32px;
+            height: 32px;
+            padding: 0;
             border-radius: 6px;
             font-size: 16px;
             line-height: 1;
             transition: all 0.15s;
+            flex-shrink: 0;
+        }
+        .sidebar-tab svg {
+            width: 18px;
+            height: 18px;
+            stroke: currentColor;
+            fill: none;
+            stroke-width: 1.8;
+            stroke-linecap: round;
+            stroke-linejoin: round;
         }
         .sidebar-tab:hover { background: var(--c-surface-hover); color: var(--c-text); }
         .sidebar-tab.active { background: var(--c-surface-active); color: var(--c-text); }
@@ -462,6 +505,9 @@
             justify-content: flex-end;
         }
 
+        .mobile-only { display: none; }
+        .desktop-only { display: inline; }
+
         .new-session-wrapper { position: relative; }
         .agent-dropdown {
             display: none;
@@ -589,12 +635,12 @@
 
         .tab-bar {
             display: none;
-            align-items: center;
-            gap: 2px;
-            padding: 4px 8px;
+            align-items: flex-end;
+            gap: 6px;
+            padding: 6px 12px 0;
             background: var(--c-surface);
             border-bottom: 1px solid var(--c-border);
-            min-height: 32px;
+            min-height: 36px;
             overflow-x: auto;
             flex-shrink: 0;
         }
@@ -603,26 +649,28 @@
             display: flex;
             align-items: center;
             gap: 6px;
-            padding: 4px 12px;
-            border-radius: 4px 4px 0 0;
-            font-size: 11px;
-            color: var(--c-text-muted);
-            background: transparent;
+            padding: 8px 14px;
+            border-radius: 10px 10px 0 0;
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--c-text-dim);
+            background: rgba(58, 123, 213, 0.08);
             cursor: pointer;
             white-space: nowrap;
             border: 1px solid transparent;
             border-bottom: none;
             transition: all var(--transition-fast);
-            max-width: 180px;
+            max-width: 220px;
             overflow: hidden;
             text-overflow: ellipsis;
             user-select: none;
         }
         .tab-item:hover { background: var(--c-surface-hover); color: var(--c-text-secondary); }
         .tab-item.active {
-            background: var(--c-bg);
+            background: rgba(58, 123, 213, 0.18);
             color: var(--c-text);
-            border-color: var(--c-border);
+            border-color: rgba(58, 123, 213, 0.38);
+            box-shadow: inset 0 1px 0 rgba(255,255,255,0.06);
         }
         .tab-item .tab-name { overflow: hidden; text-overflow: ellipsis; }
         .tab-close {
@@ -1701,6 +1749,10 @@
 
         /* 移动端适配 */
         @media (max-width: 768px) {
+            :root {
+                --mobile-header-height: calc(env(safe-area-inset-top, 0px) + 56px);
+            }
+
             .sidebar {
                 position: fixed;
                 top: 0;
@@ -1709,10 +1761,15 @@
                 z-index: 100;
                 transform: translateX(-100%);
                 transition: transform 0.25s ease;
-                width: 280px;
+                width: min(300px, 84vw);
                 margin-left: 0 !important;
                 opacity: 1 !important;
                 pointer-events: auto !important;
+                box-shadow: 18px 0 40px rgba(0,0,0,0.18);
+            }
+
+            .sidebar-resizer {
+                display: none;
             }
 
             .sidebar.open {
@@ -1732,10 +1789,22 @@
 
             .sidebar-overlay.active {
                 display: block;
+                backdrop-filter: blur(2px);
             }
 
             .header {
-                padding: 10px 12px;
+                padding: calc(env(safe-area-inset-top, 0px) + 8px) 10px 8px;
+                min-height: calc(env(safe-area-inset-top, 0px) + 40px);
+                gap: 6px;
+                position: fixed;
+                top: 0;
+                left: 0;
+                right: 0;
+                z-index: 20;
+            }
+
+            .main-content {
+                padding-top: var(--mobile-header-height);
             }
 
             .header-left .project-path {
@@ -1750,6 +1819,9 @@
             .font-size-controls {
                 display: none !important;
             }
+
+            .mobile-only { display: inline; }
+            .desktop-only { display: none; }
         }
         /* Settings panel */
         .settings-panel { padding:8px 10px; }
@@ -1858,9 +1930,9 @@
     <div class="sidebar" id="sidebar">
         <div class="sidebar-header">
             <div class="sidebar-tabs">
-                <button class="sidebar-tab active" data-tab="projects" onclick="switchSidebarTab('projects')" title="项目">&#128193;</button>
-                <button class="sidebar-tab" data-tab="tasks" onclick="switchSidebarTab('tasks')" title="定时任务">&#9202;</button>
-                <button class="sidebar-tab" data-tab="settings" onclick="switchSidebarTab('settings')" title="设置">&#9881;</button>
+                <button class="sidebar-tab active" data-tab="projects" onclick="switchSidebarTab('projects')" title="项目"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 6.5h5l2 2h10v9a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"></path><path d="M3.5 8.5h17"></path></svg></button>
+                <button class="sidebar-tab" data-tab="tasks" onclick="switchSidebarTab('tasks')" title="定时任务"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8"></circle><path d="M12 7.5v5l3 2"></path><path d="M9 3.5h6"></path></svg></button>
+                <button class="sidebar-tab" data-tab="settings" onclick="switchSidebarTab('settings')" title="设置"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="2.8"></circle><path d="M19.4 15a1 1 0 0 0 .2 1.1l.1.1a1.7 1.7 0 0 1-2.4 2.4l-.1-.1a1 1 0 0 0-1.1-.2 1 1 0 0 0-.6.9V19a1.7 1.7 0 0 1-3.4 0v-.2a1 1 0 0 0-.7-.9 1 1 0 0 0-1.1.2l-.1.1a1.7 1.7 0 1 1-2.4-2.4l.1-.1a1 1 0 0 0 .2-1.1 1 1 0 0 0-.9-.6H5a1.7 1.7 0 0 1 0-3.4h.2a1 1 0 0 0 .9-.7 1 1 0 0 0-.2-1.1l-.1-.1a1.7 1.7 0 0 1 2.4-2.4l.1.1a1 1 0 0 0 1.1.2 1 1 0 0 0 .6-.9V5a1.7 1.7 0 0 1 3.4 0v.2a1 1 0 0 0 .7.9 1 1 0 0 0 1.1-.2l.1-.1a1.7 1.7 0 0 1 2.4 2.4l-.1.1a1 1 0 0 0-.2 1.1 1 1 0 0 0 .9.6H19a1.7 1.7 0 0 1 0 3.4h-.2a1 1 0 0 0-.9.7z"></path></svg></button>
             </div>
             <button class="theme-toggle" id="sidebarThemeToggle" onclick="toggleTheme()" title="切换主题"></button>
         </div>
@@ -1923,15 +1995,9 @@
                             <button class="btn-font" onclick="changeFontSize(1)">A+</button>
                         </div>
                     </div>
-                    <div class="settings-row">
-                        <div>
-                            <span class="settings-row-label">无确认模式</span>
-                            <div style="font-size:10px;color:var(--c-text-dim);margin-top:1px;">跳过所有确认提示</div>
-                        </div>
-                        <label class="toggle-switch" style="margin:0;">
-                            <input type="checkbox" id="yoloToggle" onchange="toggleYoloMode()">
-                            <span class="toggle-slider"></span>
-                        </label>
+                    <div style="margin-bottom:16px;">
+                        <label style="font-size:13px;font-weight:500;color:var(--c-text);display:block;margin-bottom:8px;">自动执行</label>
+                        <div id="sidebarDangerSettings"></div>
                     </div>
                 </div>
 
@@ -1977,6 +2043,7 @@
         </div>
     </div>
 
+    <div class="sidebar-resizer" id="sidebarResizer" aria-hidden="true"></div>
     <div class="sidebar-overlay" id="sidebarOverlay" onclick="closeSidebar()"></div>
     <div class="toast-container" id="toastContainer"></div>
 
@@ -2002,8 +2069,12 @@
                 </div>
             </div>
             <div class="header-right">
+                <label style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--c-text-dim);margin-right:10px;white-space:nowrap;">
+                    <input type="checkbox" id="sessionDangerToggle" onchange="toggleSessionDangerMode(this.checked)">
+                    <span class="desktop-only">Auto</span>
+                </label>
                 <div class="new-session-wrapper" id="newSessionWrapper">
-                    <button class="btn btn-new" id="newSessionBtn" onclick="handleNewSession(event)" title="新建会话 (Ctrl/⌘+N)">+ 新对话</button>
+                    <button class="btn btn-new" id="newSessionBtn" onclick="handleNewSession(event)" title="新建会话 (Ctrl/⌘+N)"><span class="desktop-only">+ 新对话</span><span class="mobile-only">+</span></button>
                     <div class="agent-dropdown" id="agentDropdown">
                         <div class="agent-dropdown-list" id="agentDropdownList"></div>
                     </div>

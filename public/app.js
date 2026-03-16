@@ -35,9 +35,16 @@ let selectedAgent = 'claude';
 // ---- 设置 & Worktree ----
 let settingsRoots = [];
 const worktreeCache = {}; // projectId → { data: [...], expanded: false }
+let projectPickerIntent = null;
 
-// ---- Yolo 模式 (--dangerously-skip-permissions) ----
-let yoloMode = localStorage.getItem('yoloMode') === 'true';
+// ---- 自动执行模式 (--dangerously-skip-permissions) ----
+let globalDangerouslySkipPermissions = false;
+let sessionDangerouslySkipPermissions = false;
+
+const SIDEBAR_WIDTH_KEY = 'sidebarWidth';
+const SIDEBAR_MIN_WIDTH = 220;
+const SIDEBAR_MAX_WIDTH = 420;
+let sidebarResizeCleanup = null;
 
 // ---- 主题切换 ----
 
@@ -153,6 +160,70 @@ function showApp() {
         document.getElementById('sidebar').classList.add('collapsed');
     }
     initApp();
+}
+
+function clampSidebarWidth(width) {
+    return Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, width));
+}
+
+function applySidebarWidth(width) {
+    const sidebar = document.getElementById('sidebar');
+    if (!sidebar || window.innerWidth <= 768) return;
+    const next = clampSidebarWidth(width);
+    sidebar.style.width = next + 'px';
+    localStorage.setItem(SIDEBAR_WIDTH_KEY, String(next));
+}
+
+function initSidebarResize() {
+    if (sidebarResizeCleanup) return;
+    const sidebar = document.getElementById('sidebar');
+    const resizer = document.getElementById('sidebarResizer');
+    if (!sidebar || !resizer) return;
+
+    const savedWidth = parseInt(localStorage.getItem(SIDEBAR_WIDTH_KEY) || '', 10);
+    if (Number.isFinite(savedWidth)) {
+        applySidebarWidth(savedWidth);
+    }
+
+    const onPointerDown = (event) => {
+        if (window.innerWidth <= 768) return;
+        if (sidebar.classList.contains('collapsed')) return;
+        event.preventDefault();
+        resizer.classList.add('dragging');
+        document.body.style.userSelect = 'none';
+
+        const onPointerMove = (moveEvent) => {
+            applySidebarWidth(moveEvent.clientX);
+            doFit();
+        };
+
+        const onPointerUp = () => {
+            resizer.classList.remove('dragging');
+            document.body.style.userSelect = '';
+            window.removeEventListener('pointermove', onPointerMove);
+            window.removeEventListener('pointerup', onPointerUp);
+        };
+
+        window.addEventListener('pointermove', onPointerMove);
+        window.addEventListener('pointerup', onPointerUp);
+    };
+
+    const onResize = () => {
+        if (window.innerWidth <= 768) {
+            sidebar.style.width = '';
+            return;
+        }
+        const width = parseInt(localStorage.getItem(SIDEBAR_WIDTH_KEY) || sidebar.offsetWidth, 10);
+        if (Number.isFinite(width)) applySidebarWidth(width);
+    };
+
+    resizer.addEventListener('pointerdown', onPointerDown);
+    window.addEventListener('resize', onResize);
+
+    sidebarResizeCleanup = () => {
+        resizer.removeEventListener('pointerdown', onPointerDown);
+        window.removeEventListener('resize', onResize);
+    };
 }
 
 async function doAuth(endpoint) {
@@ -448,12 +519,69 @@ function changeFontSize(delta) {
     doFit();
 }
 
-function toggleYoloMode() {
-    yoloMode = !yoloMode;
-    localStorage.setItem('yoloMode', yoloMode);
-    const toggle = document.getElementById('yoloToggle');
-    if (toggle) toggle.checked = yoloMode;
-    showToast(yoloMode ? '已开启无确认模式' : '已关闭无确认模式');
+async function loadGlobalSettings() {
+    try {
+        const res = await authFetch('/api/settings/global');
+        if (!res.ok) return;
+        const data = await res.json();
+        globalDangerouslySkipPermissions = !!data.dangerously_skip_permissions;
+        sessionDangerouslySkipPermissions = globalDangerouslySkipPermissions;
+        syncDangerModeControls();
+    } catch {}
+}
+
+function syncDangerModeControls() {
+    const sessionToggle = document.getElementById('sessionDangerToggle');
+    if (sessionToggle) sessionToggle.checked = !!sessionDangerouslySkipPermissions;
+    document.querySelectorAll('.danger-global-checkbox').forEach(el => {
+        el.checked = !!globalDangerouslySkipPermissions;
+    });
+}
+
+async function toggleGlobalDangerMode(enabled) {
+    try {
+        const res = await authFetch('/api/settings/global', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ dangerously_skip_permissions: enabled ? 1 : 0 })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+            showToast(data.error || '保存失败');
+            syncDangerModeControls();
+            return;
+        }
+        globalDangerouslySkipPermissions = !!data.dangerously_skip_permissions;
+        sessionDangerouslySkipPermissions = globalDangerouslySkipPermissions;
+        syncDangerModeControls();
+        showToast(globalDangerouslySkipPermissions ? '已开启全局自动执行' : '已关闭全局自动执行');
+    } catch (e) {
+        showToast('保存失败: ' + e.message);
+        syncDangerModeControls();
+    }
+}
+
+function toggleSessionDangerMode(enabled) {
+    sessionDangerouslySkipPermissions = !!enabled;
+    syncDangerModeControls();
+}
+
+function renderDangerSettings() {
+    const el = document.getElementById('sidebarDangerSettings');
+    if (!el) return;
+    el.innerHTML = `
+        <div style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;">
+            <div>
+                <span style="font-size:12px;color:var(--c-text-muted);">全局默认</span>
+                <div style="font-size:10px;color:var(--c-text-dim);margin-top:1px;">新会话自动跳过确认</div>
+            </div>
+            <label class="toggle-switch" style="margin:0;">
+                <input type="checkbox" class="danger-global-checkbox" onchange="toggleGlobalDangerMode(this.checked)">
+                <span class="toggle-slider"></span>
+            </label>
+        </div>
+    `;
+    syncDangerModeControls();
 }
 
 function initTerminal() {
@@ -507,7 +635,7 @@ function createTabWebSocket(tabId, tabInfo) {
             tabWs.send(JSON.stringify({ type: 'attach', sessionId: tabInfo.pendingAttach, cols: tabInfo.term.cols, rows: tabInfo.term.rows }));
         } else if (tabInfo.pendingStart) {
             const s = tabInfo.pendingStart;
-            const startMsg = { type: 'start', projectId: s.projectId, resume: s.resume, agent: s.agent || tabInfo.agent, cols: tabInfo.term.cols, rows: tabInfo.term.rows, yolo: !!s.yolo };
+            const startMsg = { type: 'start', projectId: s.projectId, resume: s.resume, agent: s.agent || tabInfo.agent, cols: tabInfo.term.cols, rows: tabInfo.term.rows, dangerouslySkipPermissions: !!s.dangerouslySkipPermissions };
             if (s.cwd) startMsg.cwd = s.cwd;
             tabWs.send(JSON.stringify(startMsg));
         }
@@ -676,11 +804,16 @@ function openTab(projectId, sessionId, resume, agent, cwd) {
         createdAt: Date.now(),
         reconnectTimer: null,
         pendingAttach: sessionId || null,
-        pendingStart: sessionId ? null : { projectId, resume: !!resume, agent: tabAgent, cwd, yolo: yoloMode },
+        pendingStart: sessionId ? null : { projectId, resume: !!resume, agent: tabAgent, cwd, dangerouslySkipPermissions: sessionDangerouslySkipPermissions },
     };
 
     openTabs.set(tabId, tabInfo);
     tabInfo.ws = createTabWebSocket(tabId, tabInfo);
+
+    if (!sessionId && tabAgent === 'claude' && sessionDangerouslySkipPermissions !== globalDangerouslySkipPermissions) {
+        sessionDangerouslySkipPermissions = globalDangerouslySkipPermissions;
+        syncDangerModeControls();
+    }
 
     hideDashboardPanel();
     document.getElementById('emptyState').classList.add('hidden');
@@ -798,7 +931,7 @@ function startNewSession(projectId, resume) {
     hideSessionActions();
     setTimeout(() => {
         doFit();
-        wsSend({ type: 'start', projectId, resume: !!resume, cols: term.cols, rows: term.rows, yolo: yoloMode });
+        wsSend({ type: 'start', projectId, resume: !!resume, cols: term.cols, rows: term.rows, dangerouslySkipPermissions: sessionDangerouslySkipPermissions });
     }, 50);
 }
 
@@ -930,6 +1063,10 @@ function switchSession(sessionId, projectId) {
 async function loadProjects() {
     const response = await authFetch('/api/projects');
     projectsCache = await response.json();
+    if (currentProject) {
+        const nextCurrent = projectsCache.find(p => p.id === currentProject.id);
+        if (nextCurrent) currentProject = nextCurrent;
+    }
     await loadSessions();
 }
 
@@ -1108,10 +1245,13 @@ function renderProjects(overrideList, hintText) {
 
 // ---- 项目选择 ----
 
-async function selectProject(projectId) {
+async function selectProject(projectId, options = {}) {
     if (projectsCache.length === 0) await loadProjects();
     currentProject = projectsCache.find(p => p.id === projectId);
     if (!currentProject) return;
+
+    const pendingNewSession = options.startNewSession || projectPickerIntent === 'new-session';
+    if (pendingNewSession) projectPickerIntent = null;
 
     document.getElementById('projectTitle').textContent = currentProject.name;
     document.getElementById('headerProjectPath').textContent = currentProject.path;
@@ -1124,6 +1264,13 @@ async function selectProject(projectId) {
 
     renderProjects();
     closeSidebar();
+
+    if (options.skipAutoOpen || pendingNewSession) {
+        if (pendingNewSession) {
+            setTimeout(() => handleNewSession(), 0);
+        }
+        return;
+    }
 
     const liveSessions = getProjectSessions(projectId).filter(s => !s.stale);
     const latest = getLatestSession(liveSessions);
@@ -1187,10 +1334,12 @@ async function performClone(inputEl, statusEl, autoClose) {
 
 // ---- 项目快捷切换下拉 ----
 
-function toggleProjectDropdown() {
+function toggleProjectDropdown(options = {}) {
     const dropdown = document.getElementById('projectDropdown');
     const wasOpen = dropdown.classList.contains('open');
+    const preservedIntent = options.preserveIntent ? projectPickerIntent : null;
     closeAllPopups();
+    if (preservedIntent) projectPickerIntent = preservedIntent;
     if (!wasOpen) {
         dropdown.classList.add('open');
         renderProjectDropdown(projectsCache);
@@ -1215,13 +1364,23 @@ function renderProjectDropdown(projects, hintText) {
         const liveSessions = getProjectSessions(p.id).filter(s => !s.stale);
         const name = escapeHtml(p.name);
         return `<div class="project-dropdown-item ${isActive ? 'active' : ''}"
-                     onclick="selectProject('${escapeHtml(p.id)}');closeAllPopups()">
+                     onclick="handleProjectDropdownSelect('${escapeHtml(p.id)}')">
                     ${liveSessions.length > 0 ? '<span class="session-dot"></span>' : ''}
                     ${name}
                     ${liveSessions.length > 1 ? '<span class="session-count">' + liveSessions.length + '</span>' : ''}
                 </div>`;
     }).join('');
     list.innerHTML = html;
+}
+
+function handleProjectDropdownSelect(projectId) {
+    const startNewSession = projectPickerIntent === 'new-session';
+    projectPickerIntent = null;
+    selectProject(projectId, {
+        skipAutoOpen: startNewSession,
+        startNewSession
+    });
+    closeAllPopups();
 }
 
 function filterProjectDropdown(query) {
@@ -1253,6 +1412,7 @@ function handleDropdownClone(inputEl) {
 // ---- 弹出层管理 ----
 
 function closeAllPopups() {
+    projectPickerIntent = null;
     const pd = document.getElementById('projectDropdown');
     const um = document.getElementById('userMenu');
     const ad = document.getElementById('agentDropdown');
@@ -1422,13 +1582,29 @@ function switchSidebarTab(tabName) {
     const panel = document.getElementById('sidebarTab' + tabName.charAt(0).toUpperCase() + tabName.slice(1));
     if (panel) panel.classList.add('active');
     if (tabName === 'tasks') renderSidebarTasks();
-    if (tabName === 'settings') loadSettingsRoots();
+    if (tabName === 'settings') {
+        loadSettingsRoots();
+        renderDangerSettings();
+        syncDangerModeControls();
+    }
 }
 
 // ---- 新建对话（含 Agent 选择） ----
 
 function handleNewSession(event) {
-    if (!currentProject) { showToast('请先选择一个项目'); return; }
+    if (!currentProject) {
+        projectPickerIntent = 'new-session';
+        if (window.innerWidth <= 768) {
+            switchSidebarTab('projects');
+            const sidebar = document.getElementById('sidebar');
+            const overlay = document.getElementById('sidebarOverlay');
+            if (sidebar) sidebar.classList.add('open');
+            if (overlay) overlay.classList.add('active');
+        } else {
+            toggleProjectDropdown({ preserveIntent: true });
+        }
+        return;
+    }
     if (availableAgents.length > 1) {
         // 多 agent：显示下拉选择
         if (event) event.stopPropagation();
@@ -1586,7 +1762,9 @@ let appInitialized = false;
 function initApp() {
     if (appInitialized) return;
     appInitialized = true;
+    initSidebarResize();
     initTerminal();
+    loadGlobalSettings();
     loadProjects();
     loadTasks();
     loadAgents();
@@ -1594,8 +1772,6 @@ function initApp() {
     refreshHealth();
     const fsl = document.getElementById('fontSizeLabel');
     if (fsl) fsl.textContent = termFontSize + 'px';
-    const yoloToggle = document.getElementById('yoloToggle');
-    if (yoloToggle) yoloToggle.checked = yoloMode;
     setInterval(refreshHealth, 10000);
     setInterval(loadTasks, 15000);
     // 粒子系统

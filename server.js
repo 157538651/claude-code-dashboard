@@ -312,6 +312,14 @@ db.exec('CREATE INDEX IF NOT EXISTS idx_task_runs_finished ON task_runs(finished
 // 迁移: 添加 dangerously_skip_permissions 列
 try { db.exec('ALTER TABLE scheduled_tasks ADD COLUMN dangerously_skip_permissions INTEGER NOT NULL DEFAULT 1'); } catch {}
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at INTEGER NOT NULL
+  )
+`);
+
 // 启动时清理孤儿运行记录
 db.prepare("UPDATE task_runs SET status='failed', finished_at=?, error='Server restarted' WHERE status='running'").run(Date.now());
 
@@ -383,6 +391,23 @@ function scanProjects() {
   projectsCache = projects;
   projectsCacheTime = now;
   return projects;
+}
+
+function getAppSetting(key, fallback = null) {
+  const row = db.prepare('SELECT value FROM app_settings WHERE key = ?').get(key);
+  return row ? row.value : fallback;
+}
+
+function setAppSetting(key, value) {
+  db.prepare(`
+    INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+  `).run(key, value, Date.now());
+}
+
+function getBoolAppSetting(key, fallback = false) {
+  const value = getAppSetting(key, fallback ? '1' : '0');
+  return value === '1';
 }
 
 function updateProjectUsage(projectId) {
@@ -577,6 +602,20 @@ app.post('/api/projects/:id/pin', (req, res) => {
   res.json({ success: true, pinned: !!pinned });
 });
 
+// ---- 全局设置 API ----
+
+app.get('/api/settings/global', (req, res) => {
+  res.json({
+    dangerously_skip_permissions: getBoolAppSetting('dangerously_skip_permissions', false)
+  });
+});
+
+app.put('/api/settings/global', (req, res) => {
+  const enabled = req.body.dangerously_skip_permissions ? '1' : '0';
+  setAppSetting('dangerously_skip_permissions', enabled);
+  res.json({ success: true, dangerously_skip_permissions: enabled === '1' });
+});
+
 // ---- Worktree 检测 API ----
 
 app.get('/api/projects/:id/worktrees', (req, res) => {
@@ -639,7 +678,7 @@ function stripAnsi(str) {
     .replace(/\n{3,}/g, '\n\n');                    // collapse excessive blank lines
 }
 
-function createSession(projectId, cols, rows, resume, owner, extraArgs, agent, yolo) {
+function createSession(projectId, cols, rows, resume, owner, extraArgs, agent, options) {
   agent = agent || 'claude';
   if (sessions.size >= MAX_SESSIONS_GLOBAL) return { error: '全局会话数已达上限' };
   let userCount = 0;
@@ -663,15 +702,34 @@ function createSession(projectId, cols, rows, resume, owner, extraArgs, agent, y
   const env = { ...process.env };
   let args = [];
 
+  const normalizedExtraArgs = Array.isArray(extraArgs) ? extraArgs.filter(Boolean) : [];
+  const explicitDanger = options && typeof options.dangerouslySkipPermissions === 'boolean'
+    ? options.dangerouslySkipPermissions
+    : null;
+  const shouldSkipPermissions = normalizedExtraArgs.includes('--dangerously-skip-permissions')
+    || (explicitDanger !== null ? explicitDanger : getBoolAppSetting('dangerously_skip_permissions', false));
+
   if (agent === 'claude') {
     delete env.CLAUDECODE;
     if (resume) args.push('--resume');
-    if (yolo) args.push('--dangerously-skip-permissions');
+    if (shouldSkipPermissions) {
+      args.push('--dangerously-skip-permissions');
+    }
   } else if (agent === 'codex') {
     args.push('--no-alt-screen');
-    if (resume) args = ['resume', '--last', '--no-alt-screen'];
+    if (shouldSkipPermissions) {
+      args.push('--full-auto');
+    }
+    if (resume) {
+      args = ['resume', '--last', '--no-alt-screen'];
+      if (shouldSkipPermissions) {
+        args.push('--full-auto');
+      }
+    }
   }
-  if (extraArgs) args.push(...extraArgs);
+  if (normalizedExtraArgs.length > 0) {
+    args.push(...normalizedExtraArgs.filter(arg => arg !== '--dangerously-skip-permissions'));
+  }
 
   const ptyProcess = pty.spawn(binPath, args, {
     name: 'xterm-256color',
@@ -1075,7 +1133,9 @@ wss.on('connection', (ws, req) => {
     try { msg = JSON.parse(raw); } catch { return; }
 
     if (msg.type === 'start') {
-      const result = createSession(msg.cwd || msg.projectId, msg.cols, msg.rows, msg.resume, username, null, msg.agent, msg.yolo);
+      const result = createSession(msg.cwd || msg.projectId, msg.cols, msg.rows, msg.resume, username, null, msg.agent, {
+        dangerouslySkipPermissions: !!msg.dangerouslySkipPermissions
+      });
       if (!result) {
         ws.send(JSON.stringify({ type: 'error', data: '项目不存在' }));
         return;
