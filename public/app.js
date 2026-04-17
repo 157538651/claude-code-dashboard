@@ -37,7 +37,7 @@ let settingsRoots = [];
 const worktreeCache = {}; // projectId → { data: [...], expanded: false }
 let projectPickerIntent = null;
 
-// ---- 自动滚动 ----
+// ---- 自动滚动（智能跟随：贴底时跟随新输出，用户上滚后自动暂停）----
 let autoScrollEnabled = localStorage.getItem('autoScroll') !== 'false';
 
 function toggleAutoScroll(enabled) {
@@ -45,6 +45,15 @@ function toggleAutoScroll(enabled) {
     localStorage.setItem('autoScroll', enabled ? 'true' : 'false');
     const el = document.getElementById('autoScrollToggle');
     if (el) el.checked = enabled;
+}
+
+function isTermAtBottom(term) {
+    try {
+        const buf = term.buffer.active;
+        return buf.viewportY >= buf.baseY;
+    } catch {
+        return true;
+    }
 }
 
 // ---- 自动执行模式 (--dangerously-skip-permissions) ----
@@ -654,8 +663,9 @@ function createTabWebSocket(tabId, tabInfo) {
     tabWs.onmessage = (event) => {
         const msg = JSON.parse(event.data);
         if (msg.type === 'output') {
+            const wasAtBottom = isTermAtBottom(tabInfo.term);
             tabInfo.term.write(msg.data);
-            if (autoScrollEnabled) tabInfo.term.scrollToBottom();
+            if (autoScrollEnabled && wasAtBottom) tabInfo.term.scrollToBottom();
             if (tabInfo.sessionId === activeTabId) {
                 setActivityIdle(false);
                 if (activityTimeout) clearTimeout(activityTimeout);
